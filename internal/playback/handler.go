@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"os"
@@ -8,6 +9,8 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
@@ -16,13 +19,47 @@ import (
 )
 
 type Handler struct {
-	db     *gorm.DB
-	log    *zap.SugaredLogger
-	client *http.Client
+	db              *gorm.DB
+	log             *zap.SugaredLogger
+	client          *http.Client
+	containerClient *container.Client
+	account         string
+	containerName   string
 }
 
 func NewHandler(db *gorm.DB, log *zap.SugaredLogger) *Handler {
-	return &Handler{db: db, log: log, client: &http.Client{}}
+	// Initialize Azure client (supports connection string or account+key)
+	ctx := context.Background()
+	var cc *container.Client
+	account := os.Getenv("AZURE_STORAGE_ACCOUNT")
+	containerName := os.Getenv("AZURE_BLOB_CONTAINER")
+	if conn := os.Getenv("AZURE_STORAGE_CONNECTION_STRING"); conn != "" && containerName != "" {
+		c, err := container.NewClientFromConnectionString(conn, containerName, nil)
+		if err == nil {
+			cc = c
+		} else {
+			log.Errorw("azure conn string", "err", err)
+		}
+	} else if account != "" && containerName != "" {
+		cred, err := azblob.NewSharedKeyCredential(account, os.Getenv("AZURE_STORAGE_KEY"))
+		if err == nil {
+			url := "https://" + account + ".blob.core.windows.net/" + containerName
+			c, e2 := container.NewClientWithSharedKeyCredential(url, cred, nil)
+			if e2 == nil {
+				cc = c
+			} else {
+				log.Errorw("azure client", "err", e2)
+			}
+		} else {
+			log.Errorw("azure credential", "err", err)
+		}
+	}
+	if cc == nil {
+		log.Warn("azure container client not initialized; playback will fail for private blobs")
+	}
+
+	_ = ctx // reserved
+	return &Handler{db: db, log: log, client: &http.Client{}, containerClient: cc, account: account, containerName: containerName}
 }
 
 // GET /playback/videos/:uploadId
@@ -58,17 +95,37 @@ func (h *Handler) GetMaster(c *gin.Context) {
 		c.String(http.StatusBadRequest, "master not ready")
 		return
 	}
-	resp, err := h.client.Get(v.HLSMasterURL)
-	if err != nil {
-		h.log.Errorw("fetch master", "err", err)
-		c.String(http.StatusBadGateway, "upstream error")
+	if h.containerClient == nil {
+		// fallback to original HTTP (likely public) path
+		resp, err := h.client.Get(v.HLSMasterURL)
+		if err != nil {
+			h.log.Errorw("fetch master", "err", err)
+			c.String(http.StatusBadGateway, "upstream error")
+			return
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		// Naive rewrite of rendition lines (<res>/index.m3u8)
+		re := regexp.MustCompile(`(?m)^(1080p|720p|480p|360p)/index.m3u8$`)
+		rewritten := re.ReplaceAllStringFunc(string(b), func(s string) string {
+			parts := strings.Split(s, "/")
+			return path.Join(parts[0], "index.m3u8")
+		})
+		c.Header("Content-Type", "application/vnd.apple.mpegurl")
+		c.String(http.StatusOK, rewritten)
 		return
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	// Private: fetch blob path derived from stored URL
+	blobPath := strings.TrimPrefix(strings.SplitN(v.HLSMasterURL, ".blob.core.windows.net/", 2)[1], h.containerName+"/")
+	data, err := h.downloadBlob(c, blobPath)
+	if err != nil {
+		h.log.Errorw("master download", "err", err)
+		c.String(http.StatusBadGateway, "blob error")
+		return
+	}
 	// Naive rewrite of rendition lines (<res>/index.m3u8)
 	re := regexp.MustCompile(`(?m)^(1080p|720p|480p|360p)/index.m3u8$`)
-	rewritten := re.ReplaceAllStringFunc(string(b), func(s string) string {
+	rewritten := re.ReplaceAllStringFunc(string(data), func(s string) string {
 		parts := strings.Split(s, "/")
 		return path.Join(parts[0], "index.m3u8")
 	})
@@ -160,3 +217,20 @@ func (h *Handler) Ready(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": 
 
 // Debug config
 func (h *Handler) Config(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"env": os.Environ()}) }
+
+func (h *Handler) downloadBlob(c *gin.Context, path string) ([]byte, error) {
+	ctx := c.Request.Context()
+	bc, err := h.containerClient.NewBlobClient(path)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := bc.DownloadStream(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
