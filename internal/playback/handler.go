@@ -146,6 +146,19 @@ func (h *Handler) GetVariant(c *gin.Context) {
 		c.String(http.StatusNotFound, "not found")
 		return
 	}
+	if h.containerClient != nil { // private blob path
+		base := h.blobBase(v.HLSMasterURL)
+		blobPath := base + "/" + rendition + "/index.m3u8"
+		data, err := h.downloadBlob(c, blobPath)
+		if err != nil {
+			h.log.Errorw("variant download", "err", err)
+			c.String(http.StatusBadGateway, "blob error")
+			return
+		}
+		c.Header("Content-Type", "application/vnd.apple.mpegurl")
+		c.String(http.StatusOK, string(data))
+		return
+	}
 	base := baseHLSPath(v.HLSMasterURL)
 	url := base + "/" + rendition + "/index.m3u8"
 	proxyM3U8(c, h.client, url)
@@ -163,6 +176,25 @@ func (h *Handler) GetSegment(c *gin.Context) {
 	var v models.Video
 	if err := h.db.Where("upload_id = ?", uploadID).First(&v).Error; err != nil {
 		c.String(http.StatusNotFound, "not found")
+		return
+	}
+	if h.containerClient != nil { // private
+		base := h.blobBase(v.HLSMasterURL)
+		blobPath := base + "/" + rendition + "/" + segment
+		data, err := h.downloadBlob(c, blobPath)
+		if err != nil {
+			h.log.Errorw("segment download", "err", err)
+			c.String(http.StatusBadGateway, "blob error")
+			return
+		}
+		// Basic content-type guess
+		if strings.HasSuffix(segment, ".m3u8") {
+			c.Header("Content-Type", "application/vnd.apple.mpegurl")
+		} else {
+			c.Header("Content-Type", "video/MP2T")
+		}
+		c.Header("Cache-Control", "public, max-age=60")
+		c.Data(http.StatusOK, c.Writer.Header().Get("Content-Type"), data)
 		return
 	}
 	base := baseHLSPath(v.HLSMasterURL)
@@ -220,10 +252,7 @@ func (h *Handler) Config(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"env": os
 
 func (h *Handler) downloadBlob(c *gin.Context, path string) ([]byte, error) {
 	ctx := c.Request.Context()
-	bc, err := h.containerClient.NewBlobClient(path)
-	if err != nil {
-		return nil, err
-	}
+	bc := h.containerClient.NewBlobClient(path)
 	resp, err := bc.DownloadStream(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -233,4 +262,10 @@ func (h *Handler) downloadBlob(c *gin.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 	return b, nil
+}
+
+// Helper to compute base path inside container (without container prefix and without master.m3u8)
+func (h *Handler) blobBase(masterURL string) string {
+	p := strings.TrimPrefix(strings.SplitN(masterURL, ".blob.core.windows.net/", 2)[1], h.containerName+"/")
+	return strings.TrimSuffix(p, "/master.m3u8")
 }
