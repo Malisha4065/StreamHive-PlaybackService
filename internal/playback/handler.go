@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
+	"github.com/streamhive/playback-service/internal/cache"
 	"github.com/streamhive/playback-service/internal/models"
 )
 
@@ -26,6 +27,7 @@ type Handler struct {
 	containerClient *container.Client
 	account         string
 	containerName   string
+	cache           *cache.CacheService
 }
 
 func NewHandler(db *gorm.DB, log *zap.SugaredLogger) *Handler {
@@ -59,8 +61,23 @@ func NewHandler(db *gorm.DB, log *zap.SugaredLogger) *Handler {
 		log.Warn("azure container client not initialized; playback will fail for private blobs")
 	}
 
+	// Initialize cache service
+	cacheService, err := cache.NewCacheService(log)
+	if err != nil {
+		log.Errorw("failed to initialize cache service", "err", err)
+		cacheService = nil // Continue without cache
+	}
+
 	_ = ctx // reserved
-	return &Handler{db: db, log: log, client: &http.Client{}, containerClient: cc, account: account, containerName: containerName}
+	return &Handler{
+		db:              db,
+		log:             log,
+		client:          &http.Client{},
+		containerClient: cc,
+		account:         account,
+		containerName:   containerName,
+		cache:           cacheService,
+	}
 }
 
 // GET /playback/videos/:uploadId
@@ -182,12 +199,37 @@ func (h *Handler) GetSegment(c *gin.Context) {
 	if h.containerClient != nil { // private
 		base := h.blobBase(v.HLSMasterURL)
 		blobPath := base + "/" + rendition + "/" + segment
-		data, err := h.downloadBlob(c, blobPath)
-		if err != nil {
-			h.log.Errorw("segment download", "err", err)
-			c.String(http.StatusBadGateway, "blob error")
-			return
+		
+		// Try cache first
+		var data []byte
+		var err error
+		
+		if h.cache != nil {
+			cacheKey := h.cache.GenerateKey("segment", uploadID, blobPath)
+			data, err = h.cache.Get(c.Request.Context(), cacheKey)
+			if err != nil {
+				h.log.Warnw("cache get error", "err", err)
+			}
 		}
+		
+		// Cache miss or no cache - fetch from Azure
+		if data == nil {
+			data, err = h.downloadBlob(c, blobPath)
+			if err != nil {
+				h.log.Errorw("segment download", "err", err)
+				c.String(http.StatusBadGateway, "blob error")
+				return
+			}
+			
+			// Store in cache if available
+			if h.cache != nil && data != nil {
+				cacheKey := h.cache.GenerateKey("segment", uploadID, blobPath)
+				if err := h.cache.Set(c.Request.Context(), cacheKey, data); err != nil {
+					h.log.Warnw("cache set error", "err", err)
+				}
+			}
+		}
+		
 		// Basic content-type guess
 		if strings.HasSuffix(segment, ".m3u8") {
 			c.Header("Content-Type", "application/vnd.apple.mpegurl")
@@ -218,14 +260,39 @@ func (h *Handler) GetThumbnail(c *gin.Context) {
 	}
 
 	if h.containerClient != nil {
-		// Private blob: serve from Azure storage
+		// Private blob: serve from Azure storage with caching
 		thumbnailPath := fmt.Sprintf("thumbnails/%s/%s.jpg", v.UserID, v.UploadID)
-		data, err := h.downloadBlob(c, thumbnailPath)
-		if err != nil {
-			h.log.Errorw("thumbnail download", "err", err)
-			c.String(http.StatusNotFound, "Thumbnail not found")
-			return
+		
+		// Try cache first
+		var data []byte
+		var err error
+		
+		if h.cache != nil {
+			cacheKey := h.cache.GenerateKey("thumbnail", uploadID, thumbnailPath)
+			data, err = h.cache.Get(c.Request.Context(), cacheKey)
+			if err != nil {
+				h.log.Warnw("cache get error", "err", err)
+			}
 		}
+		
+		// Cache miss or no cache - fetch from Azure
+		if data == nil {
+			data, err = h.downloadBlob(c, thumbnailPath)
+			if err != nil {
+				h.log.Errorw("thumbnail download", "err", err)
+				c.String(http.StatusNotFound, "Thumbnail not found")
+				return
+			}
+			
+			// Store in cache if available
+			if h.cache != nil && data != nil {
+				cacheKey := h.cache.GenerateKey("thumbnail", uploadID, thumbnailPath)
+				if err := h.cache.Set(c.Request.Context(), cacheKey, data); err != nil {
+					h.log.Warnw("cache set error", "err", err)
+				}
+			}
+		}
+		
 		c.Header("Content-Type", "image/jpeg")
 		c.Header("Cache-Control", "public, max-age=3600")
 		c.Data(http.StatusOK, "image/jpeg", data)
