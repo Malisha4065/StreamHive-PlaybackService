@@ -2,6 +2,7 @@ package playback
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -200,6 +201,39 @@ func (h *Handler) GetSegment(c *gin.Context) {
 	base := baseHLSPath(v.HLSMasterURL)
 	url := base + "/" + rendition + "/" + segment
 	proxyBinary(c, h.client, url)
+}
+
+// GetThumbnail serves video thumbnails
+func (h *Handler) GetThumbnail(c *gin.Context) {
+	uploadID := c.Param("uploadId")
+	var v models.Video
+	if err := h.db.Where("upload_id = ?", uploadID).First(&v).Error; err != nil {
+		c.String(http.StatusNotFound, "Video not found")
+		return
+	}
+
+	if v.ThumbnailURL == "" {
+		c.String(http.StatusNotFound, "Thumbnail not available")
+		return
+	}
+
+	if h.containerClient != nil {
+		// Private blob: serve from Azure storage
+		thumbnailPath := fmt.Sprintf("thumbnails/%s/%s.jpg", v.UserID, v.UploadID)
+		data, err := h.downloadBlob(c, thumbnailPath)
+		if err != nil {
+			h.log.Errorw("thumbnail download", "err", err)
+			c.String(http.StatusNotFound, "Thumbnail not found")
+			return
+		}
+		c.Header("Content-Type", "image/jpeg")
+		c.Header("Cache-Control", "public, max-age=3600")
+		c.Data(http.StatusOK, "image/jpeg", data)
+		return
+	}
+
+	// Public blob: redirect to direct URL
+	c.Redirect(http.StatusFound, v.ThumbnailURL)
 }
 
 func allowedRendition(r string) bool {

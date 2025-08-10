@@ -21,6 +21,7 @@ type Video struct {
 	Category         string    `json:"category"`
 	OriginalFilename string    `json:"original_filename"`
 	HLSMasterURL     string    `json:"hls_master_url"`
+	ThumbnailURL     string    `json:"thumbnail_url"`
 	Duration         float64   `json:"duration"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`

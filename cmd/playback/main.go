@@ -50,6 +50,7 @@ func main() {
 	r.GET("/playback/videos/:uploadId/master.m3u8", h.GetMaster)
 	r.GET("/playback/videos/:uploadId/:rendition/index.m3u8", h.GetVariant)
 	r.GET("/playback/videos/:uploadId/:rendition/:segment", h.GetSegment)
+	r.GET("/playback/videos/:uploadId/thumbnail.jpg", h.GetThumbnail)
 
 	port := getEnv("PORT", "8090")
 	srv := &http.Server{Addr: ":" + port, Handler: r, ReadHeaderTimeout: 10 * time.Second}
