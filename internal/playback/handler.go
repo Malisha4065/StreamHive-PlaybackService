@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path"
@@ -20,6 +21,14 @@ import (
 	"github.com/streamhive/playback-service/internal/models"
 )
 
+// Helper function to read secret from file or fallback to environment variable
+func getSecret(filePath, envVar string) string {
+	if data, err := ioutil.ReadFile(filePath); err == nil {
+		return strings.TrimSpace(string(data))
+	}
+	return os.Getenv(envVar)
+}
+
 type Handler struct {
 	db              *gorm.DB
 	log             *zap.SugaredLogger
@@ -34,9 +43,9 @@ func NewHandler(db *gorm.DB, log *zap.SugaredLogger) *Handler {
 	// Initialize Azure client (supports connection string or account+key)
 	ctx := context.Background()
 	var cc *container.Client
-	account := os.Getenv("AZURE_STORAGE_ACCOUNT")
-	containerName := os.Getenv("AZURE_BLOB_CONTAINER")
-	if conn := os.Getenv("AZURE_STORAGE_CONNECTION_STRING"); conn != "" && containerName != "" {
+	account := getSecret("/mnt/secrets-store/azure-storage-account", "AZURE_STORAGE_ACCOUNT")
+	containerName := getSecret("/mnt/secrets-store/azure-storage-raw-container", "AZURE_BLOB_CONTAINER")
+	if conn := getSecret("/mnt/secrets-store/azure-storage-connection-string", "AZURE_STORAGE_CONNECTION_STRING"); conn != "" && containerName != "" {
 		c, err := container.NewClientFromConnectionString(conn, containerName, nil)
 		if err == nil {
 			cc = c
@@ -44,7 +53,7 @@ func NewHandler(db *gorm.DB, log *zap.SugaredLogger) *Handler {
 			log.Errorw("azure conn string", "err", err)
 		}
 	} else if account != "" && containerName != "" {
-		cred, err := azblob.NewSharedKeyCredential(account, os.Getenv("AZURE_STORAGE_KEY"))
+		cred, err := azblob.NewSharedKeyCredential(account, getSecret("/mnt/secrets-store/azure-storage-key", "AZURE_STORAGE_KEY"))
 		if err == nil {
 			url := "https://" + account + ".blob.core.windows.net/" + containerName
 			c, e2 := container.NewClientWithSharedKeyCredential(url, cred, nil)
