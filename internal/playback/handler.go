@@ -143,7 +143,7 @@ func (h *Handler) GetMaster(c *gin.Context) {
 		return
 	}
 	// Private: fetch blob path derived from stored URL
-	blobPath := strings.TrimPrefix(strings.SplitN(v.HLSMasterURL, ".blob.core.windows.net/", 2)[1], h.containerName+"/")
+	blobPath := h.extractBlobPath(v.HLSMasterURL)
 	data, err := h.downloadBlob(c, blobPath)
 	if err != nil {
 		h.log.Errorw("master download", "err", err)
@@ -208,11 +208,11 @@ func (h *Handler) GetSegment(c *gin.Context) {
 	if h.containerClient != nil { // private
 		base := h.blobBase(v.HLSMasterURL)
 		blobPath := base + "/" + rendition + "/" + segment
-		
+
 		// Try cache first
 		var data []byte
 		var err error
-		
+
 		if h.cache != nil {
 			cacheKey := h.cache.GenerateKey("segment", uploadID, blobPath)
 			data, err = h.cache.Get(c.Request.Context(), cacheKey)
@@ -220,7 +220,7 @@ func (h *Handler) GetSegment(c *gin.Context) {
 				h.log.Warnw("cache get error", "err", err)
 			}
 		}
-		
+
 		// Cache miss or no cache - fetch from Azure
 		if data == nil {
 			data, err = h.downloadBlob(c, blobPath)
@@ -229,7 +229,7 @@ func (h *Handler) GetSegment(c *gin.Context) {
 				c.String(http.StatusBadGateway, "blob error")
 				return
 			}
-			
+
 			// Store in cache if available
 			if h.cache != nil && data != nil {
 				cacheKey := h.cache.GenerateKey("segment", uploadID, blobPath)
@@ -238,7 +238,7 @@ func (h *Handler) GetSegment(c *gin.Context) {
 				}
 			}
 		}
-		
+
 		// Basic content-type guess
 		if strings.HasSuffix(segment, ".m3u8") {
 			c.Header("Content-Type", "application/vnd.apple.mpegurl")
@@ -271,11 +271,11 @@ func (h *Handler) GetThumbnail(c *gin.Context) {
 	if h.containerClient != nil {
 		// Private blob: serve from Azure storage with caching
 		thumbnailPath := fmt.Sprintf("thumbnails/%s/%s.jpg", v.UserID, v.UploadID)
-		
+
 		// Try cache first
 		var data []byte
 		var err error
-		
+
 		if h.cache != nil {
 			cacheKey := h.cache.GenerateKey("thumbnail", uploadID, thumbnailPath)
 			data, err = h.cache.Get(c.Request.Context(), cacheKey)
@@ -283,7 +283,7 @@ func (h *Handler) GetThumbnail(c *gin.Context) {
 				h.log.Warnw("cache get error", "err", err)
 			}
 		}
-		
+
 		// Cache miss or no cache - fetch from Azure
 		if data == nil {
 			data, err = h.downloadBlob(c, thumbnailPath)
@@ -292,7 +292,7 @@ func (h *Handler) GetThumbnail(c *gin.Context) {
 				c.String(http.StatusNotFound, "Thumbnail not found")
 				return
 			}
-			
+
 			// Store in cache if available
 			if h.cache != nil && data != nil {
 				cacheKey := h.cache.GenerateKey("thumbnail", uploadID, thumbnailPath)
@@ -301,7 +301,7 @@ func (h *Handler) GetThumbnail(c *gin.Context) {
 				}
 			}
 		}
-		
+
 		c.Header("Content-Type", "image/jpeg")
 		c.Header("Cache-Control", "public, max-age=3600")
 		c.Data(http.StatusOK, "image/jpeg", data)
@@ -376,6 +376,20 @@ func (h *Handler) downloadBlob(c *gin.Context, path string) ([]byte, error) {
 
 // Helper to compute base path inside container (without container prefix and without master.m3u8)
 func (h *Handler) blobBase(masterURL string) string {
-	p := strings.TrimPrefix(strings.SplitN(masterURL, ".blob.core.windows.net/", 2)[1], h.containerName+"/")
-	return strings.TrimSuffix(p, "/master.m3u8")
+	blobPath := h.extractBlobPath(masterURL)
+	return strings.TrimSuffix(blobPath, "/master.m3u8")
+}
+
+// extractBlobPath extracts the blob path from either a full Azure URL or relative path
+func (h *Handler) extractBlobPath(url string) string {
+	if strings.Contains(url, ".blob.core.windows.net/") {
+		// Full Azure URL: extract path after container name
+		parts := strings.SplitN(url, ".blob.core.windows.net/", 2)
+		if len(parts) == 2 {
+			return strings.TrimPrefix(parts[1], h.containerName+"/")
+		}
+	}
+
+	// Relative URL: remove leading slash and return as-is
+	return strings.TrimPrefix(url, "/")
 }
