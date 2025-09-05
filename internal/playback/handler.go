@@ -240,10 +240,16 @@ func (h *Handler) GetSegment(c *gin.Context) {
 		}
 
 		// Basic content-type guess
-		if strings.HasSuffix(segment, ".m3u8") {
+		switch {
+		case strings.HasSuffix(segment, ".m3u8"):
 			c.Header("Content-Type", "application/vnd.apple.mpegurl")
-		} else {
-			c.Header("Content-Type", "video/MP2T")
+		case strings.HasSuffix(segment, ".m4s"):
+			// CMAF/fMP4 segments
+			c.Header("Content-Type", "video/iso.segment")
+		case strings.HasSuffix(segment, ".ts"):
+			c.Header("Content-Type", "video/mp2t")
+		default:
+			c.Header("Content-Type", "application/octet-stream")
 		}
 		c.Header("Cache-Control", "public, max-age=60")
 		c.Data(http.StatusOK, c.Writer.Header().Get("Content-Type"), data)
@@ -344,11 +350,21 @@ func proxyBinary(c *gin.Context, cl *http.Client, url string) {
 		return
 	}
 	defer resp.Body.Close()
-	for k, v := range resp.Header {
-		if len(v) > 0 {
-			c.Header(k, v[0])
+	// Forward known headers if present, otherwise derive based on URL
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		switch {
+		case strings.HasSuffix(url, ".m3u8"):
+			ct = "application/vnd.apple.mpegurl"
+		case strings.HasSuffix(url, ".m4s"):
+			ct = "video/iso.segment"
+		case strings.HasSuffix(url, ".ts"):
+			ct = "video/mp2t"
+		default:
+			ct = "application/octet-stream"
 		}
 	}
+	c.Header("Content-Type", ct)
 	c.Header("Cache-Control", "public, max-age=60")
 	c.Status(resp.StatusCode)
 	io.Copy(c.Writer, resp.Body)
