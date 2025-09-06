@@ -6,6 +6,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.4.0
 	github.com/gin-gonic/gin v1.10.1
 	github.com/redis/go-redis/v9 v9.7.0
+	github.com/sony/gobreaker v0.5.0
 	go.uber.org/zap v1.27.0
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/gorm v1.30.1

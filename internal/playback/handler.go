@@ -10,10 +10,13 @@ import (
 	"path"
 	"regexp"
 	"strings"
+    "time"
+	"strconv"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/gin-gonic/gin"
+	"github.com/sony/gobreaker"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
@@ -37,6 +40,7 @@ type Handler struct {
 	account         string
 	containerName   string
 	cache           *cache.CacheService
+	breaker         *gobreaker.CircuitBreaker
 }
 
 func NewHandler(db *gorm.DB, log *zap.SugaredLogger) *Handler {
@@ -78,14 +82,46 @@ func NewHandler(db *gorm.DB, log *zap.SugaredLogger) *Handler {
 	}
 
 	_ = ctx // reserved
+
+	// HTTP client with timeout (env: PLAYBACK_HTTP_TIMEOUT_MS)
+	httpTimeout := 5 * time.Second
+	if v := os.Getenv("PLAYBACK_HTTP_TIMEOUT_MS"); v != "" {
+		if d, err := time.ParseDuration(v + "ms"); err == nil {
+			httpTimeout = d
+		}
+	}
+	httpClient := &http.Client{Timeout: httpTimeout}
+
+	// Circuit breaker for Azure blob downloads
+	cbTimeout := 10 * time.Second
+	if v := os.Getenv("PLAYBACK_CB_RESET_MS"); v != "" {
+		if d, err := time.ParseDuration(v + "ms"); err == nil {
+			cbTimeout = d
+		}
+	}
+	cbFailures := uint32(5)
+	if v := os.Getenv("PLAYBACK_CB_CONSECUTIVE_FAILS"); v != "" {
+		// ignore invalid values to keep simple
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cbFailures = uint32(n)
+		}
+	}
+	breaker := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:    "azure-download",
+		Timeout: cbTimeout,
+		ReadyToTrip: func(c gobreaker.Counts) bool {
+			return c.ConsecutiveFailures >= cbFailures
+		},
+	})
 	return &Handler{
 		db:              db,
 		log:             log,
-		client:          &http.Client{},
+	client:          httpClient,
 		containerClient: cc,
 		account:         account,
 		containerName:   containerName,
 		cache:           cacheService,
+	breaker:         breaker,
 	}
 }
 
@@ -377,17 +413,52 @@ func (h *Handler) Ready(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": 
 func (h *Handler) Config(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"env": os.Environ()}) }
 
 func (h *Handler) downloadBlob(c *gin.Context, path string) ([]byte, error) {
-	ctx := c.Request.Context()
-	bc := h.containerClient.NewBlobClient(path)
-	resp, err := bc.DownloadStream(ctx, nil)
-	if err != nil {
-		return nil, err
+	// Retry with backoff and breaker; per-attempt timeout (env: PLAYBACK_AZURE_TIMEOUT_MS)
+	attemptTimeout := 3 * time.Second
+	if v := os.Getenv("PLAYBACK_AZURE_TIMEOUT_MS"); v != "" {
+		if d, err := time.ParseDuration(v + "ms"); err == nil {
+			attemptTimeout = d
+		}
 	}
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	retries := 2
+	if v := os.Getenv("PLAYBACK_AZURE_RETRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			retries = n
+		}
 	}
-	return b, nil
+
+	var lastErr error
+	backoff := 200 * time.Millisecond
+	for i := 0; i <= retries; i++ {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), attemptTimeout)
+		bc := h.containerClient.NewBlobClient(path)
+		res, err := h.breaker.Execute(func() (interface{}, error) {
+			resp, err := bc.DownloadStream(ctx, nil)
+			if err != nil {
+				return nil, err
+			}
+			b, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return nil, err
+			}
+			return b, nil
+		})
+		cancel()
+		if err == nil {
+			if data, ok := res.([]byte); ok {
+				return data, nil
+			}
+			return nil, fmt.Errorf("unexpected breaker result")
+		}
+		lastErr = err
+		if i < retries {
+			time.Sleep(backoff)
+			if backoff < 1500*time.Millisecond {
+				backoff *= 2
+			}
+		}
+	}
+	return nil, lastErr
 }
 
 // Helper to compute base path inside container (without container prefix and without master.m3u8)
